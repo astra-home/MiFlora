@@ -20,9 +20,9 @@ This project uses `cargo deny` to check dependencies.
 
 ### Firmware version & battery level
 
-`00001a02-0000-1000-8000-00805f9b34fb: READ`
-example response: [49, 56, 51, 46, 51, 46, 53]
-18 3.3.5
+`00001a02-0000-1000-8000-00805f9b34fb: READ`  
+example response: [49, 56, 51, 46, 51, 46, 53]  
+18 3.3.5  
 
 ### Device mode
 `00001a00-0000-1000-8000-00805f9b34fb: READ | WRITE`

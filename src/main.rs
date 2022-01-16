@@ -1,17 +1,23 @@
-use btleplug::api::{Central, Manager as _, Peripheral as _, ScanFilter, CharPropFlags, Characteristic, WriteType};
+use btleplug::api::{
+    BDAddr, Central, CentralEvent, CharPropFlags, Characteristic, Manager as _, Peripheral as _,
+    ScanFilter, WriteType,
+};
 use btleplug::platform::{Adapter, Manager, Peripheral};
-use std::error::{Error};
+use futures::stream::StreamExt;
+use std::error::Error;
+use std::str;
 use std::time::Duration;
 use tokio::time;
-use std::str;
-use futures::stream::StreamExt;
 
+fn is_flower_care_device(address: BDAddr) -> bool {
+    address.to_string().starts_with("C4:7C:8D:")
+}
 
 enum FlowerCharacteristic {
     Version,
     Battery,
     RealTime,
-    Mode
+    Mode,
 }
 
 struct Flower {
@@ -20,28 +26,56 @@ struct Flower {
 
 impl Flower {
     pub fn new(peripheral: Peripheral) -> Flower {
-        Flower {
-            peripheral,
+        Flower { peripheral }
+    }
+
+    pub async fn connect(&self) -> Result<(), btleplug::Error> {
+        match self.peripheral.connect().await {
+            Ok(()) => {
+                match self.peripheral.discover_services().await {
+                    Ok(()) => Ok(()),
+                    Err(e) => Err(e),
+                }
+            },
+            Err(e) => Err(e),
         }
     }
 
-    pub async fn connect(&self) -> Result<(), &'static str>  {
-        if self.peripheral.connect().await.is_err() {
-            return Err("Failed to connect to flower care device");
+    pub async fn connect_with_retry(&self, attempts: u8) -> Result<(), &'static str> {
+        for attempt in 1..(attempts + 1) {
+            println!("Connecting to flower care device attempt {}", attempt);
+            if self.connect().await.is_ok() {
+                return Ok(());
+            }
+            time::sleep(Duration::from_secs(5)).await;
         }
-        if self.peripheral.discover_services().await.is_err() {
-            return Err("Failed to discover services");
-        }
-        Ok(())
+
+        Err("Failed to connect to flower care device")
     }
 
     fn characteristic(&self, flower_char: FlowerCharacteristic) -> Characteristic {
         let characteristics = self.peripheral.characteristics();
         match flower_char {
-            FlowerCharacteristic::Version => characteristics.iter().find(|c| c.uuid.to_string() == "00001a02-0000-1000-8000-00805f9b34fb").unwrap().to_owned(),
-            FlowerCharacteristic::Battery => characteristics.iter().find(|c| c.uuid.to_string() == "00001a02-0000-1000-8000-00805f9b34fb").unwrap().to_owned(),
-            FlowerCharacteristic::RealTime => characteristics.iter().find(|c| c.uuid.to_string() == "00001a01-0000-1000-8000-00805f9b34fb").unwrap().to_owned(),
-            FlowerCharacteristic::Mode => characteristics.iter().find(|c| c.uuid.to_string() == "00001a00-0000-1000-8000-00805f9b34fb").unwrap().to_owned(),
+            FlowerCharacteristic::Version => characteristics
+                .iter()
+                .find(|c| c.uuid.to_string() == "00001a02-0000-1000-8000-00805f9b34fb")
+                .unwrap()
+                .to_owned(),
+            FlowerCharacteristic::Battery => characteristics
+                .iter()
+                .find(|c| c.uuid.to_string() == "00001a02-0000-1000-8000-00805f9b34fb")
+                .unwrap()
+                .to_owned(),
+            FlowerCharacteristic::RealTime => characteristics
+                .iter()
+                .find(|c| c.uuid.to_string() == "00001a01-0000-1000-8000-00805f9b34fb")
+                .unwrap()
+                .to_owned(),
+            FlowerCharacteristic::Mode => characteristics
+                .iter()
+                .find(|c| c.uuid.to_string() == "00001a00-0000-1000-8000-00805f9b34fb")
+                .unwrap()
+                .to_owned(),
         }
     }
 
@@ -59,16 +93,29 @@ impl Flower {
 
     pub async fn real_time_read(&self) -> Result<(), &'static str> {
         let mode_char = self.characteristic(FlowerCharacteristic::Mode);
-        self.peripheral.write(&mode_char, &[0xA0, 0x1F], WriteType::WithResponse).await.unwrap();
+        self.peripheral
+            .write(&mode_char, &[0xA0, 0x1F], WriteType::WithResponse)
+            .await
+            .unwrap();
         let char = self.characteristic(FlowerCharacteristic::RealTime);
         self.peripheral.subscribe(&char).await.unwrap();
         let mut notification_stream = self.peripheral.notifications().await.unwrap();
         while let Some(data) = notification_stream.next().await {
-            if data.uuid.to_string().eq("00001a01-0000-1000-8000-00805f9b34fb") {
+            if data
+                .uuid
+                .to_string()
+                .eq("00001a01-0000-1000-8000-00805f9b34fb")
+            {
                 println!("Temperature: {:?}°C", (data.value[0] as f32) / 10.0);
-                println!("Sunlight: {:?} LUX", i32::from_le_bytes(data.value[3..=6].try_into().unwrap()));
+                println!(
+                    "Sunlight: {:?} LUX",
+                    i32::from_le_bytes(data.value[3..=6].try_into().unwrap())
+                );
                 println!("Moisture: {:?}%", data.value[7]);
-                println!("Fertilization: {:?}µS/cm", u16::from_le_bytes(data.value[8..=9].try_into().unwrap()));
+                println!(
+                    "Fertilization: {:?}µS/cm",
+                    u16::from_le_bytes(data.value[8..=9].try_into().unwrap())
+                );
                 println!("---");
             } else {
                 println!("Unknown notification: {:?}", data);
@@ -83,7 +130,7 @@ impl Flower {
         }
         Ok(())
     }
-    
+
     #[allow(dead_code)]
     pub async fn read_all(&self) -> Result<(), Box<dyn Error>> {
         let chars = self.peripheral.characteristics();
@@ -111,48 +158,40 @@ async fn main() -> Result<(), Box<dyn Error>> {
     };
 
     let central = adapters.into_iter().next().unwrap();
+    let mut events = central.events().await.unwrap();
 
     // start scanning for devices
-    match central.start_scan(ScanFilter::default()).await {
-        Ok(_) => (),
-        Err(e) => {
-            panic!("Failed to start scan: {}", e);
-        }
+    if central.start_scan(ScanFilter::default()).await.is_err() {
+        panic!("Failed to start scan");
     }
-    time::sleep(Duration::from_secs(20)).await;
 
-    // instead of waiting, you can use central.event_receiver() to fetch a channel and
-    // be notified of new devices
-    let flower = match find_flower_care_device(&central).await {
-        Some(flower) => flower,
-        None => {
-            panic!("Failed to find flower care device");
-        }
-    };
-
-    time::sleep(Duration::from_secs(5)).await;
-    flower.connect().await?;
-    let battery = flower.battery().await.unwrap();
-    println!("Battery: {}", battery);
-    let version = flower.version().await.unwrap();
-    println!("Version: {}", version);
-    // flower.read_all().await?;
-    flower.real_time_read().await?;
-    flower.disconnect().await?;
-    Ok(())
-}
-
-async fn find_flower_care_device(central: &Adapter) -> Option<Flower> {
-    println!(
-        "number of devices found: {}",
-        central.peripherals().await.unwrap().len()
-    );
-    for p in central.peripherals().await.unwrap() {
-        if p.address()
-            .to_string()
-            .starts_with("C4:7C:8D:6D:AD:D1") {
-                return Some(Flower::new(p));
+    while let Some(event) = events.next().await {
+        match event {
+            CentralEvent::DeviceDiscovered(device) => {
+                let peripheral = central.peripheral(&device).await.unwrap();
+                if is_flower_care_device(peripheral.address()) {
+                    tokio::spawn(async move {
+                        println!("Discovered device: {:?}", device);
+                        let flower = Flower::new(peripheral);
+                        time::sleep(Duration::from_secs(5)).await;
+                        match flower.connect_with_retry(5).await {
+                            Ok(()) => {},
+                            Err(e) => {
+                                println!("Failed to connect to device: {:?}", e);
+                                return;
+                            },
+                        };
+                        let battery = flower.battery().await.unwrap();
+                        println!("Battery: {}", battery);
+                        let version = flower.version().await.unwrap();
+                        println!("Version: {}", version);
+                        flower.disconnect().await.unwrap();
+                    });
+                }
             }
+            _ => {}
+        }
     }
-    None
+    central.stop_scan().await?;
+    Ok(())
 }
